@@ -9833,7 +9833,14 @@ fn deblock_plane_chroma(
                             let recorded = if mbaff_frame_flag {
                                 BS_NOT_DERIVED
                             } else {
-                                luma_bs[luma_bs_index(mb_w, mb_x, mb_y, false, lq_x.rem_euclid(16) / 4, ly.rem_euclid(16) / 4)]
+                                luma_bs[luma_bs_index(
+                                    mb_w,
+                                    mb_x,
+                                    mb_y,
+                                    false,
+                                    lq_x.rem_euclid(16) / 4,
+                                    ly.rem_euclid(16) / 4,
+                                )]
                             };
                             let bs = if recorded != BS_NOT_DERIVED {
                                 recorded
@@ -9980,7 +9987,14 @@ fn deblock_plane_chroma(
                             let recorded = if mbaff_frame_flag {
                                 BS_NOT_DERIVED
                             } else {
-                                luma_bs[luma_bs_index(mb_w, mb_x, mb_y, true, lq_y.rem_euclid(16) / 4, lx.rem_euclid(16) / 4)]
+                                luma_bs[luma_bs_index(
+                                    mb_w,
+                                    mb_x,
+                                    mb_y,
+                                    true,
+                                    lq_y.rem_euclid(16) / 4,
+                                    lx.rem_euclid(16) / 4,
+                                )]
                             };
                             let bs = if recorded != BS_NOT_DERIVED {
                                 recorded
