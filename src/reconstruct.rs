@@ -456,6 +456,9 @@ fn mb_sample_origin(
 /// and MBAFF field MBs (stride 2 per eq. 6-10), and handles the MBAFF
 /// chroma origin derivation that `(mb_px / 16) * MbWidthC` breaks for
 /// field MBs whose `mb_py` is an odd pair-local offset.
+/// Samples in the largest motion-compensation partition (16x16).
+const MAX_PARTITION_SAMPLES: usize = 256;
+
 #[derive(Debug, Clone, Copy)]
 struct MbWriter {
     /// Luma MB origin x — `mb_px` from [`mb_sample_origin`].
@@ -4974,9 +4977,12 @@ fn process_partition<R: RefPicProvider>(
         }
     };
 
-    // Allocate partition-sized scratch buffers.
-    let mut l0_buf = vec![0i32; (w as usize) * (h as usize)];
-    let mut l1_buf = vec![0i32; (w as usize) * (h as usize)];
+    // Partition-sized scratch buffers, on the stack: a partition is at
+    // most 16x16 samples.
+    let mut l0_buf_store = [0i32; MAX_PARTITION_SAMPLES];
+    let l0_buf = &mut l0_buf_store[..(w as usize) * (h as usize)];
+    let mut l1_buf_store = [0i32; MAX_PARTITION_SAMPLES];
+    let l1_buf = &mut l1_buf_store[..(w as usize) * (h as usize)];
     let has_l0 = matches!(
         part.mode,
         PartMode::L0Only | PartMode::BiPred | PartMode::Direct
@@ -5007,7 +5013,7 @@ fn process_partition<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            &mut l0_buf,
+            l0_buf,
             fld,
         )?;
     }
@@ -5032,7 +5038,7 @@ fn process_partition<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            &mut l1_buf,
+            l1_buf,
             fld,
         )?;
         if inter_debug {
@@ -5141,10 +5147,11 @@ fn process_partition<R: RefPicProvider>(
     // §8.4.2.3.3 — implicit bipred: apply eq. 8-276 with
     // `logWD = 5`, offsets = 0, and POC-derived weights.
     if let Some((w0, w1, log2_wd)) = implicit_weights {
-        let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+        let mut scratch_store = [0i32; MAX_PARTITION_SAMPLES];
+        let scratch = &mut scratch_store[..(w as usize) * (h as usize)];
         weighted_pred_explicit(
-            Some(l0_buf.as_slice()),
-            Some(l1_buf.as_slice()),
+            Some(&l0_buf[..]),
+            Some(&l1_buf[..]),
             w as usize,
             w,
             h,
@@ -5159,7 +5166,7 @@ fn process_partition<R: RefPicProvider>(
             },
             log2_wd,
             bit_depth_y,
-            &mut scratch,
+            scratch,
             w as usize,
         );
         for py in 0..h as usize {
@@ -5193,14 +5200,15 @@ fn process_partition<R: RefPicProvider>(
             let w_l1 = luma_weight_entry(pwt, 1, wp_ref_l1, log2_wd);
             // Scratch partition-sized buffer so we can use the spec's
             // dst/dst_stride API directly.
-            let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+            let mut scratch_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch = &mut scratch_store[..(w as usize) * (h as usize)];
             let l0_opt = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                Some(l0_buf.as_slice())
+                Some(&l0_buf[..])
             } else {
                 None
             };
             let l1_opt = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                Some(l1_buf.as_slice())
+                Some(&l1_buf[..])
             } else {
                 None
             };
@@ -5215,7 +5223,7 @@ fn process_partition<R: RefPicProvider>(
                 w_l1,
                 log2_wd,
                 bit_depth_y,
-                &mut scratch,
+                scratch,
                 w as usize,
             );
             // Copy back into pred_luma at partition-local position.
@@ -5256,10 +5264,14 @@ fn process_partition<R: RefPicProvider>(
         let mbw_c_use = mbw_c;
         let _ = mbh_c;
 
-        let mut l0_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l0_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l1_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l1_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l0_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l0_cb = &mut l0_cb_store[..(c_w as usize) * (c_h as usize)];
+        let mut l0_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l0_cr = &mut l0_cr_store[..(c_w as usize) * (c_h as usize)];
+        let mut l1_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l1_cb = &mut l1_cb_store[..(c_w as usize) * (c_h as usize)];
+        let mut l1_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l1_cr = &mut l1_cr_store[..(c_w as usize) * (c_h as usize)];
         // §8.4.1.4 Table 8-10 — at ChromaArrayType == 1 a FIELD MB
         // referencing the OPPOSITE-parity field offsets the vertical
         // chroma MV: ref top field + current bottom → +2, ref bottom
@@ -5305,8 +5317,8 @@ fn process_partition<R: RefPicProvider>(
                 c_h,
                 chroma_array_type,
                 bit_depth_c,
-                &mut l0_cb,
-                &mut l0_cr,
+                l0_cb,
+                l0_cr,
                 fld,
             )?;
         }
@@ -5321,8 +5333,8 @@ fn process_partition<R: RefPicProvider>(
                 c_h,
                 chroma_array_type,
                 bit_depth_c,
-                &mut l1_cb,
-                &mut l1_cr,
+                l1_cb,
+                l1_cr,
                 fld,
             )?;
         }
@@ -5335,8 +5347,10 @@ fn process_partition<R: RefPicProvider>(
         // are specified for "C" replaced by L/Cb/Cr with the same
         // DistScaleFactor, and eq. 8-277 fixes logWDC = 5.
         if let Some((w0, w1, log2_wd)) = implicit_weights {
-            let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-            let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+            let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
+            let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
             let w_entry_l0 = WeightedEntry {
                 weight: w0,
                 offset: 0,
@@ -5346,8 +5360,8 @@ fn process_partition<R: RefPicProvider>(
                 offset: 0,
             };
             weighted_pred_explicit(
-                Some(l0_cb.as_slice()),
-                Some(l1_cb.as_slice()),
+                Some(&l0_cb[..]),
+                Some(&l1_cb[..]),
                 c_w as usize,
                 c_w,
                 c_h,
@@ -5356,12 +5370,12 @@ fn process_partition<R: RefPicProvider>(
                 w_entry_l1,
                 log2_wd,
                 bit_depth_c,
-                &mut scratch_cb,
+                scratch_cb,
                 c_w as usize,
             );
             weighted_pred_explicit(
-                Some(l0_cr.as_slice()),
-                Some(l1_cr.as_slice()),
+                Some(&l0_cr[..]),
+                Some(&l1_cr[..]),
                 c_w as usize,
                 c_w,
                 c_h,
@@ -5370,7 +5384,7 @@ fn process_partition<R: RefPicProvider>(
                 w_entry_l1,
                 log2_wd,
                 bit_depth_c,
-                &mut scratch_cr,
+                scratch_cr,
                 c_w as usize,
             );
             for py in 0..c_h as usize {
@@ -5396,25 +5410,27 @@ fn process_partition<R: RefPicProvider>(
                     chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd_c),
                 );
 
-                let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-                let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+                let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+                let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
+                let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+                let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
                 let cb_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(l0_cb.as_slice())
+                    Some(&l0_cb[..])
                 } else {
                     None
                 };
                 let cb_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(l1_cb.as_slice())
+                    Some(&l1_cb[..])
                 } else {
                     None
                 };
                 let cr_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(l0_cr.as_slice())
+                    Some(&l0_cr[..])
                 } else {
                     None
                 };
                 let cr_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(l1_cr.as_slice())
+                    Some(&l1_cr[..])
                 } else {
                     None
                 };
@@ -5429,7 +5445,7 @@ fn process_partition<R: RefPicProvider>(
                     w_cb_l1,
                     log2_wd_c,
                     bit_depth_c,
-                    &mut scratch_cb,
+                    scratch_cb,
                     c_w as usize,
                 );
                 weighted_pred_explicit(
@@ -5443,7 +5459,7 @@ fn process_partition<R: RefPicProvider>(
                     w_cr_l1,
                     log2_wd_c,
                     bit_depth_c,
-                    &mut scratch_cr,
+                    scratch_cr,
                     c_w as usize,
                 );
                 for py in 0..c_h as usize {
@@ -5518,10 +5534,14 @@ fn process_partition<R: RefPicProvider>(
         let c_part_x = part.x as i32;
         let c_part_y = part.y as i32;
 
-        let mut l0_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l0_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l1_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l1_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l0_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l0_cb = &mut l0_cb_store[..(c_w as usize) * (c_h as usize)];
+        let mut l0_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l0_cr = &mut l0_cr_store[..(c_w as usize) * (c_h as usize)];
+        let mut l1_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l1_cb = &mut l1_cb_store[..(c_w as usize) * (c_h as usize)];
+        let mut l1_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l1_cr = &mut l1_cr_store[..(c_w as usize) * (c_h as usize)];
         if has_l0 {
             let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
             mc_chroma_partition_444(
@@ -5532,8 +5552,8 @@ fn process_partition<R: RefPicProvider>(
                 c_w,
                 c_h,
                 bit_depth_c,
-                &mut l0_cb,
-                &mut l0_cr,
+                l0_cb,
+                l0_cr,
                 fld,
             )?;
         }
@@ -5547,8 +5567,8 @@ fn process_partition<R: RefPicProvider>(
                 c_w,
                 c_h,
                 bit_depth_c,
-                &mut l1_cb,
-                &mut l1_cr,
+                l1_cb,
+                l1_cr,
                 fld,
             )?;
         }
@@ -5556,8 +5576,10 @@ fn process_partition<R: RefPicProvider>(
         if let Some((w0, w1, log2_wd)) = implicit_weights {
             // §8.4.2.3.3 — implicit bipred reuses the luma (w0, w1,
             // log2WD=5) triple for chroma with zero offsets.
-            let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-            let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+            let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
+            let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
             let w_entry_l0 = WeightedEntry {
                 weight: w0,
                 offset: 0,
@@ -5567,8 +5589,8 @@ fn process_partition<R: RefPicProvider>(
                 offset: 0,
             };
             weighted_pred_explicit(
-                Some(l0_cb.as_slice()),
-                Some(l1_cb.as_slice()),
+                Some(&l0_cb[..]),
+                Some(&l1_cb[..]),
                 c_w as usize,
                 c_w,
                 c_h,
@@ -5577,12 +5599,12 @@ fn process_partition<R: RefPicProvider>(
                 w_entry_l1,
                 log2_wd,
                 bit_depth_c,
-                &mut scratch_cb,
+                scratch_cb,
                 c_w as usize,
             );
             weighted_pred_explicit(
-                Some(l0_cr.as_slice()),
-                Some(l1_cr.as_slice()),
+                Some(&l0_cr[..]),
+                Some(&l1_cr[..]),
                 c_w as usize,
                 c_w,
                 c_h,
@@ -5591,7 +5613,7 @@ fn process_partition<R: RefPicProvider>(
                 w_entry_l1,
                 log2_wd,
                 bit_depth_c,
-                &mut scratch_cr,
+                scratch_cr,
                 c_w as usize,
             );
             for py in 0..c_h as usize {
@@ -5618,25 +5640,27 @@ fn process_partition<R: RefPicProvider>(
                     chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd_c),
                 );
 
-                let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-                let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+                let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+                let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
+                let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+                let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
                 let cb_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(l0_cb.as_slice())
+                    Some(&l0_cb[..])
                 } else {
                     None
                 };
                 let cb_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(l1_cb.as_slice())
+                    Some(&l1_cb[..])
                 } else {
                     None
                 };
                 let cr_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(l0_cr.as_slice())
+                    Some(&l0_cr[..])
                 } else {
                     None
                 };
                 let cr_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(l1_cr.as_slice())
+                    Some(&l1_cr[..])
                 } else {
                     None
                 };
@@ -5651,7 +5675,7 @@ fn process_partition<R: RefPicProvider>(
                     w_cb_l1,
                     log2_wd_c,
                     bit_depth_c,
-                    &mut scratch_cb,
+                    scratch_cb,
                     c_w as usize,
                 );
                 weighted_pred_explicit(
@@ -5665,7 +5689,7 @@ fn process_partition<R: RefPicProvider>(
                     w_cr_l1,
                     log2_wd_c,
                     bit_depth_c,
-                    &mut scratch_cr,
+                    scratch_cr,
                     c_w as usize,
                 );
                 for py in 0..c_h as usize {
@@ -8255,6 +8279,9 @@ fn deblock_picture(
         }
         return;
     }
+    // §8.7.2.1 last paragraph — chroma edges take the bS of their luma
+    // edge; the luma pass records each bS it derives for the chroma pass.
+    let mut luma_bs = vec![BS_NOT_DERIVED; (grid.width_in_mbs * grid.height_in_mbs) as usize * 32];
     deblock_plane_luma(
         pic,
         grid,
@@ -8264,6 +8291,7 @@ fn deblock_picture(
         mbaff_frame_flag,
         field_pic,
         mb_field_flags,
+        &mut luma_bs,
     );
     if pic.chroma_array_type == 1 || pic.chroma_array_type == 2 {
         deblock_plane_chroma(
@@ -8276,6 +8304,7 @@ fn deblock_picture(
             mbaff_frame_flag,
             field_pic,
             mb_field_flags,
+            &luma_bs,
         );
     } else if pic.chroma_array_type == 3 {
         // §8.7.2 eq. (8-450) — for ChromaArrayType == 3 (4:4:4) the
@@ -8549,13 +8578,14 @@ fn mbaff_edge_bs(
             .get(q_addr as usize)
             .copied()
             .unwrap_or(false);
-    let diff_ref_mv = !p_info.is_intra
-        && !q_info.is_intra
-        && different_ref_or_mv_luma(p_info, q_info, p_in.0, p_in.1, q_in.0, q_in.1, field_units);
     let p_blk4_z = blk4_raster_index((p_in.0 / 4) as u8, (p_in.1 / 4) as u8) as usize;
     let q_blk4_z = blk4_raster_index((q_in.0 / 4) as u8, (q_in.1 / 4) as u8) as usize;
     let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
     let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+    // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+    // neither side is intra and neither has nonzero coefficients.
+    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
+        && different_ref_or_mv_luma(p_info, q_info, p_in.0, p_in.1, q_in.0, q_in.1, field_units);
     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
         bs_pair_flags(p_addr, q_addr, true, false, mb_field_flags);
     let bs = derive_boundary_strength(BsInputs {
@@ -9402,6 +9432,18 @@ fn mv_delta_below_4(a: (i16, i16), b: (i16, i16), field_units: bool) -> bool {
     (a.0 as i32 - b.0 as i32).abs() < 4 && (a.1 as i32 - b.1 as i32).abs() < v_thresh
 }
 
+/// [`deblock_plane_luma`]'s record of a luma edge segment it did not
+/// derive a bS for.
+const BS_NOT_DERIVED: u8 = u8::MAX;
+
+/// Index of a luma edge segment in the per-picture bS record: the MB
+/// holding the edge's q side, the direction (0 vertical, 1 horizontal),
+/// the edge (0..4, in 4-sample steps) and the 4-sample segment along it.
+#[inline]
+fn luma_bs_index(mb_w: i32, mb_x: i32, mb_y: i32, horizontal: bool, edge: i32, seg: i32) -> usize {
+    ((((mb_y * mb_w + mb_x) * 2 + horizontal as i32) * 4 + edge) * 4 + seg) as usize
+}
+
 #[allow(clippy::too_many_arguments)]
 fn deblock_plane_luma(
     pic: &mut Picture,
@@ -9412,6 +9454,7 @@ fn deblock_plane_luma(
     mbaff_frame_flag: bool,
     field_pic: bool,
     mb_field_flags: &[bool],
+    luma_bs: &mut [u8],
 ) {
     let w = pic.width_in_samples as i32;
     let h = pic.height_in_samples as i32;
@@ -9519,8 +9562,17 @@ fn deblock_plane_luma(
                     } else {
                         field_pic
                     };
-                    let diff_ref_mv = !p_info.is_intra
-                        && !q_info.is_intra
+                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
+                    // Consult the per-block mask set at reconstruct-time.
+                    let p_blk4_z =
+                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+                    let q_blk4_z =
+                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                    // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                    // neither side is intra and neither has nonzero coefficients.
+                    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
                         && different_ref_or_mv_luma(
                             p_info,
                             q_info,
@@ -9530,14 +9582,6 @@ fn deblock_plane_luma(
                             q_in_mb_y,
                             field_units,
                         );
-                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
-                    // Consult the per-block mask set at reconstruct-time.
-                    let p_blk4_z =
-                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
-                    let q_blk4_z =
-                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
-                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
                         bs_pair_flags(p_addr, q_addr, mbaff_frame_flag, field_pic, mb_field_flags);
                     let bs = derive_boundary_strength(BsInputs {
@@ -9552,6 +9596,9 @@ fn deblock_plane_luma(
                         mbaff_or_field,
                         both_in_frame_mbs,
                     });
+                    if !mbaff_frame_flag {
+                        luma_bs[luma_bs_index(mb_w, mb_x, mb_y, false, edge_off, seg)] = bs;
+                    }
                     if bs == 0 {
                         continue;
                     }
@@ -9632,8 +9679,16 @@ fn deblock_plane_luma(
                     } else {
                         field_pic
                     };
-                    let diff_ref_mv = !p_info.is_intra
-                        && !q_info.is_intra
+                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
+                    let p_blk4_z =
+                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+                    let q_blk4_z =
+                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                    // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                    // neither side is intra and neither has nonzero coefficients.
+                    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
                         && different_ref_or_mv_luma(
                             p_info,
                             q_info,
@@ -9643,13 +9698,6 @@ fn deblock_plane_luma(
                             q_in_mb_y,
                             field_units,
                         );
-                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
-                    let p_blk4_z =
-                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
-                    let q_blk4_z =
-                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
-                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
                         bs_pair_flags(p_addr, q_addr, mbaff_frame_flag, field_pic, mb_field_flags);
                     let bs = derive_boundary_strength(BsInputs {
@@ -9664,6 +9712,9 @@ fn deblock_plane_luma(
                         mbaff_or_field,
                         both_in_frame_mbs,
                     });
+                    if !mbaff_frame_flag {
+                        luma_bs[luma_bs_index(mb_w, mb_x, mb_y, true, edge_off, seg)] = bs;
+                    }
                     if bs == 0 {
                         continue;
                     }
@@ -9699,6 +9750,7 @@ fn deblock_plane_chroma(
     mbaff_frame_flag: bool,
     field_pic: bool,
     mb_field_flags: &[bool],
+    luma_bs: &[u8],
 ) {
     let _ = pps; // QPc derivation keeps QP_Y indirectly; handled inside.
     let cw = pic.chroma_width() as i32;
@@ -9796,70 +9848,88 @@ fn deblock_plane_chroma(
                                 (Some(p), Some(q)) if p.available && q.available => (p, q),
                                 _ => continue,
                             };
-                            let is_mb_edge = p_addr != q_addr;
-                            // §8.7.2.1 last paragraph — chroma bS inherits
-                            // from the corresponding luma edge at the
-                            // mapped luma coordinate (chroma-x *
-                            // SubWidthC, chroma-y * SubHeightC).
-                            let p_in_mb_x = (lp_x).rem_euclid(16) as u32;
-                            let p_in_mb_y = (ly).rem_euclid(16) as u32;
-                            let q_in_mb_x = (lq_x).rem_euclid(16) as u32;
-                            let q_in_mb_y = (ly).rem_euclid(16) as u32;
-                            let field_units = if mbaff_frame_flag {
-                                mb_field_flags
-                                    .get(p_addr as usize)
-                                    .copied()
-                                    .unwrap_or(false)
-                                    && mb_field_flags
-                                        .get(q_addr as usize)
+                            let recorded = if mbaff_frame_flag {
+                                BS_NOT_DERIVED
+                            } else {
+                                luma_bs[luma_bs_index(
+                                    mb_w,
+                                    mb_x,
+                                    mb_y,
+                                    false,
+                                    lq_x.rem_euclid(16) / 4,
+                                    ly.rem_euclid(16) / 4,
+                                )]
+                            };
+                            let bs = if recorded != BS_NOT_DERIVED {
+                                recorded
+                            } else {
+                                let is_mb_edge = p_addr != q_addr;
+                                // §8.7.2.1 last paragraph — chroma bS inherits
+                                // from the corresponding luma edge at the
+                                // mapped luma coordinate (chroma-x *
+                                // SubWidthC, chroma-y * SubHeightC).
+                                let p_in_mb_x = (lp_x).rem_euclid(16) as u32;
+                                let p_in_mb_y = (ly).rem_euclid(16) as u32;
+                                let q_in_mb_x = (lq_x).rem_euclid(16) as u32;
+                                let q_in_mb_y = (ly).rem_euclid(16) as u32;
+                                let field_units = if mbaff_frame_flag {
+                                    mb_field_flags
+                                        .get(p_addr as usize)
                                         .copied()
                                         .unwrap_or(false)
-                            } else {
-                                field_pic
+                                        && mb_field_flags
+                                            .get(q_addr as usize)
+                                            .copied()
+                                            .unwrap_or(false)
+                                } else {
+                                    field_pic
+                                };
+                                let p_blk4_z =
+                                    blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
+                                        as usize;
+                                let q_blk4_z =
+                                    blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
+                                        as usize;
+                                let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                                let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                                // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                                // neither side is intra and neither has nonzero coefficients.
+                                let diff_ref_mv =
+                                    !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
+                                        && different_ref_or_mv_luma(
+                                            p_info,
+                                            q_info,
+                                            p_in_mb_x,
+                                            p_in_mb_y,
+                                            q_in_mb_x,
+                                            q_in_mb_y,
+                                            field_units,
+                                        );
+                                let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
+                                    bs_pair_flags(
+                                        p_addr,
+                                        q_addr,
+                                        mbaff_frame_flag,
+                                        field_pic,
+                                        mb_field_flags,
+                                    );
+                                derive_boundary_strength(BsInputs {
+                                    p_is_intra: p_info.is_intra,
+                                    q_is_intra: q_info.is_intra,
+                                    is_mb_edge,
+                                    is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
+                                    either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+                                    different_ref_or_mv: diff_ref_mv,
+                                    mixed_mode_edge,
+                                    vertical_edge: true,
+                                    mbaff_or_field,
+                                    both_in_frame_mbs,
+                                })
                             };
-                            let diff_ref_mv = !p_info.is_intra
-                                && !q_info.is_intra
-                                && different_ref_or_mv_luma(
-                                    p_info,
-                                    q_info,
-                                    p_in_mb_x,
-                                    p_in_mb_y,
-                                    q_in_mb_x,
-                                    q_in_mb_y,
-                                    field_units,
-                                );
-                            let p_blk4_z =
-                                blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
-                                    as usize;
-                            let q_blk4_z =
-                                blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
-                                    as usize;
-                            let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                            let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
-                            let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
-                                bs_pair_flags(
-                                    p_addr,
-                                    q_addr,
-                                    mbaff_frame_flag,
-                                    field_pic,
-                                    mb_field_flags,
-                                );
-                            let bs = derive_boundary_strength(BsInputs {
-                                p_is_intra: p_info.is_intra,
-                                q_is_intra: q_info.is_intra,
-                                is_mb_edge,
-                                is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
-                                either_has_nonzero_coeffs: p_has_nz || q_has_nz,
-                                different_ref_or_mv: diff_ref_mv,
-                                mixed_mode_edge,
-                                vertical_edge: true,
-                                mbaff_or_field,
-                                both_in_frame_mbs,
-                            });
                             if deblock_trace_enabled() {
                                 eprintln!(
-                                    "DBL C{} Vx={edge_x} y0={y0} bs={bs} plane={plane} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={} p_nz={} q_nz={} diff_ref_mv={}",
-                                    plane, p_info.is_intra, q_info.is_intra, p_has_nz, q_has_nz, diff_ref_mv,
+                                    "DBL C{} Vx={edge_x} y0={y0} bs={bs} plane={plane} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={}",
+                                    plane, p_info.is_intra, q_info.is_intra,
                                 );
                             }
                             if bs == 0 {
@@ -9931,64 +10001,82 @@ fn deblock_plane_chroma(
                                 (Some(p), Some(q)) if p.available && q.available => (p, q),
                                 _ => continue,
                             };
-                            let is_mb_edge = p_addr != q_addr;
-                            // §8.7.2.1 last paragraph — chroma bS inherits
-                            // from the corresponding luma edge.
-                            let p_in_mb_x = lx.rem_euclid(16) as u32;
-                            let p_in_mb_y = lp_y.rem_euclid(16) as u32;
-                            let q_in_mb_x = lx.rem_euclid(16) as u32;
-                            let q_in_mb_y = lq_y.rem_euclid(16) as u32;
-                            let field_units = if mbaff_frame_flag {
-                                mb_field_flags
-                                    .get(p_addr as usize)
-                                    .copied()
-                                    .unwrap_or(false)
-                                    && mb_field_flags
-                                        .get(q_addr as usize)
+                            let recorded = if mbaff_frame_flag {
+                                BS_NOT_DERIVED
+                            } else {
+                                luma_bs[luma_bs_index(
+                                    mb_w,
+                                    mb_x,
+                                    mb_y,
+                                    true,
+                                    lq_y.rem_euclid(16) / 4,
+                                    lx.rem_euclid(16) / 4,
+                                )]
+                            };
+                            let bs = if recorded != BS_NOT_DERIVED {
+                                recorded
+                            } else {
+                                let is_mb_edge = p_addr != q_addr;
+                                // §8.7.2.1 last paragraph — chroma bS inherits
+                                // from the corresponding luma edge.
+                                let p_in_mb_x = lx.rem_euclid(16) as u32;
+                                let p_in_mb_y = lp_y.rem_euclid(16) as u32;
+                                let q_in_mb_x = lx.rem_euclid(16) as u32;
+                                let q_in_mb_y = lq_y.rem_euclid(16) as u32;
+                                let field_units = if mbaff_frame_flag {
+                                    mb_field_flags
+                                        .get(p_addr as usize)
                                         .copied()
                                         .unwrap_or(false)
-                            } else {
-                                field_pic
+                                        && mb_field_flags
+                                            .get(q_addr as usize)
+                                            .copied()
+                                            .unwrap_or(false)
+                                } else {
+                                    field_pic
+                                };
+                                let p_blk4_z =
+                                    blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
+                                        as usize;
+                                let q_blk4_z =
+                                    blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
+                                        as usize;
+                                let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                                let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                                // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                                // neither side is intra and neither has nonzero coefficients.
+                                let diff_ref_mv =
+                                    !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
+                                        && different_ref_or_mv_luma(
+                                            p_info,
+                                            q_info,
+                                            p_in_mb_x,
+                                            p_in_mb_y,
+                                            q_in_mb_x,
+                                            q_in_mb_y,
+                                            field_units,
+                                        );
+                                let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
+                                    bs_pair_flags(
+                                        p_addr,
+                                        q_addr,
+                                        mbaff_frame_flag,
+                                        field_pic,
+                                        mb_field_flags,
+                                    );
+                                derive_boundary_strength(BsInputs {
+                                    p_is_intra: p_info.is_intra,
+                                    q_is_intra: q_info.is_intra,
+                                    is_mb_edge,
+                                    is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
+                                    either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+                                    different_ref_or_mv: diff_ref_mv,
+                                    mixed_mode_edge,
+                                    vertical_edge: false,
+                                    mbaff_or_field,
+                                    both_in_frame_mbs,
+                                })
                             };
-                            let diff_ref_mv = !p_info.is_intra
-                                && !q_info.is_intra
-                                && different_ref_or_mv_luma(
-                                    p_info,
-                                    q_info,
-                                    p_in_mb_x,
-                                    p_in_mb_y,
-                                    q_in_mb_x,
-                                    q_in_mb_y,
-                                    field_units,
-                                );
-                            let p_blk4_z =
-                                blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
-                                    as usize;
-                            let q_blk4_z =
-                                blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
-                                    as usize;
-                            let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                            let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
-                            let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
-                                bs_pair_flags(
-                                    p_addr,
-                                    q_addr,
-                                    mbaff_frame_flag,
-                                    field_pic,
-                                    mb_field_flags,
-                                );
-                            let bs = derive_boundary_strength(BsInputs {
-                                p_is_intra: p_info.is_intra,
-                                q_is_intra: q_info.is_intra,
-                                is_mb_edge,
-                                is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
-                                either_has_nonzero_coeffs: p_has_nz || q_has_nz,
-                                different_ref_or_mv: diff_ref_mv,
-                                mixed_mode_edge,
-                                vertical_edge: false,
-                                mbaff_or_field,
-                                both_in_frame_mbs,
-                            });
                             if bs == 0 {
                                 continue;
                             }
@@ -10302,8 +10390,13 @@ fn derive_chroma_444_bs(
     field_units: bool,
 ) -> u8 {
     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) = pair_flags;
-    let diff_ref_mv = !p_info.is_intra
-        && !q_info.is_intra
+    let p_blk4_z = blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+    let q_blk4_z = blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+    // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+    // neither side is intra and neither has nonzero coefficients.
+    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
         && different_ref_or_mv_luma(
             p_info,
             q_info,
@@ -10313,10 +10406,6 @@ fn derive_chroma_444_bs(
             q_in_mb_y,
             field_units,
         );
-    let p_blk4_z = blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
-    let q_blk4_z = blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
-    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
     derive_boundary_strength(BsInputs {
         p_is_intra: p_info.is_intra,
         q_is_intra: q_info.is_intra,
