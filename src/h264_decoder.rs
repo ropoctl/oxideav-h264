@@ -54,7 +54,7 @@ use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::mb_grid::MbGrid;
 use crate::picture::Picture;
-use crate::poc::{derive_poc, PocResult, PocSlice, PocSps, PocState};
+use crate::poc::{PocResult, PocSlice, PocSps, PocState, derive_poc};
 use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
 use crate::slice_header::{
@@ -347,6 +347,12 @@ pub struct H264CodecDecoder {
     /// `bit_depth_chroma_minus8 + 8` — only populated when the avcC
     /// record carries the §5.2.4.1.1 High-profile extension.
     avcc_bit_depth_chroma: Option<u8>,
+
+    /// Worker budget from [`Decoder::set_execution_context`]. `1`
+    /// (the default) decodes on the calling thread only; more spreads
+    /// reconstruction and deblocking over worker threads. The output is
+    /// identical for every value.
+    threads: usize,
 }
 
 impl H264CodecDecoder {
@@ -383,7 +389,14 @@ impl H264CodecDecoder {
             avcc_chroma_format: None,
             avcc_bit_depth_luma: None,
             avcc_bit_depth_chroma: None,
+            threads: 1,
         }
+    }
+
+    /// Set the worker budget (see [`Decoder::set_execution_context`]).
+    /// `0` is treated as `1`.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
     }
 
     /// §5.2.4.1.1 ISO/IEC 14496-15 — `AVCDecoderConfigurationRecord`.
@@ -1085,16 +1098,17 @@ impl H264CodecDecoder {
             // with `PrevRefFrameNum` itself is the
             // second-field / non-reference-following-reference case and
             // is checked by the §7.4.1.2.4 picture-boundary logic.)
-            if !is_idr && !sps.gaps_in_frame_num_value_allowed_flag {
-                if let Some(prev) = self.prev_ref_frame_num {
-                    let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
-                    let expected = (prev + 1) % max_frame_num;
-                    if header.frame_num != prev && header.frame_num != expected {
-                        return Err(Error::invalid(format!(
-                            "h264 slice_header: frame_num {} after PrevRefFrameNum {} (§7.4.3 requires {} when gaps_in_frame_num_value_allowed_flag is 0)",
-                            header.frame_num, prev, expected
-                        )));
-                    }
+            if !is_idr
+                && !sps.gaps_in_frame_num_value_allowed_flag
+                && let Some(prev) = self.prev_ref_frame_num
+            {
+                let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
+                let expected = (prev + 1) % max_frame_num;
+                if header.frame_num != prev && header.frame_num != expected {
+                    return Err(Error::invalid(format!(
+                        "h264 slice_header: frame_num {} after PrevRefFrameNum {} (§7.4.3 requires {} when gaps_in_frame_num_value_allowed_flag is 0)",
+                        header.frame_num, prev, expected
+                    )));
                 }
             }
 
@@ -1619,7 +1633,7 @@ impl H264CodecDecoder {
             list_0_pair_keys: l0_pair_keys,
             list_1_pair_keys: l1_pair_keys,
         };
-        reconstruct::reconstruct_slice_no_deblock(
+        reconstruct::reconstruct_slice_no_deblock_threaded(
             &sd,
             header,
             sps,
@@ -1627,6 +1641,7 @@ impl H264CodecDecoder {
             &provider,
             &mut in_progress.pic,
             &mut in_progress.grid,
+            self.threads,
         )
         .map_err(|e| Error::invalid(format!("h264 reconstruct: {e}")))?;
 
@@ -1840,7 +1855,7 @@ impl H264CodecDecoder {
         let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
         let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !first_header.field_pic_flag;
         if deblock_enabled {
-            reconstruct::deblock_picture_full(
+            reconstruct::deblock_picture_full_threaded(
                 &mut pic,
                 &grid,
                 deblock_alpha_off,
@@ -1851,6 +1866,7 @@ impl H264CodecDecoder {
                 mbaff_frame_flag,
                 first_header.field_pic_flag,
                 &mb_field_flags,
+                self.threads,
             );
         }
 
@@ -2665,6 +2681,10 @@ fn slice_mmco_to_ref_mmco(op: &SliceMmcoOp) -> RefMmcoOp {
 impl Decoder for H264CodecDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.set_threads(ctx.threads);
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
